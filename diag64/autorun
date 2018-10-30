@@ -1,0 +1,586 @@
+#!/bin/sh
+
+IP="($MGR_IPv4)"
+NFS="($NFS)"
+NFSPATH="${IP}:${NFS}"
+RESURL="($MGR_URLv4)?id=($AUTH_ID)"
+
+STATEURL="${RESURL}&func=serveroperprogress"
+#!/bin/sh
+# vim: ts=4 sw=4 et
+
+prepare () {
+	sed -i -r '/^#*(PasswordAuthentication)/c PasswordAuthentication yes' /etc/ssh/sshd_config
+	service sshd restart
+	usermod -s /bin/bash root
+	sed -i 's/\ -nl\ \/bin\/bashlogin//g' /etc/inittab
+	sleep 1
+	telinit q
+	rm -f /etc/init.d/fixinittab
+	rm -f /etc/runlevels/default/fixinittab
+    echo "alias tw_cli='linux32 /sbin/tw_cli'" >> /etc/bash/bashrc
+    echo "nameserver ($NAMESERVER)" >> /etc/resolv.conf
+    echo "nameserver ($NAMESERVER)" >> /etc/resolv.conf.tail
+
+	mkdir -p /root/.ssh
+	cat >> /root/.ssh/authorized_keys << EOF
+($SSHPUBKEYS)
+EOF
+	chmod 700 /root/.ssh
+	chmod 600 /root/.ssh/authorized_keys
+}
+
+urlencode() {
+	python -c "import sys; from urllib import urlencode; print urlencode({\"${1}\": sys.stdin.read()})" 
+}
+
+dmi_proc() {
+	dmidecode -t processor | urlencode dmi_proc
+}
+
+
+dmi_mem() {
+	dmidecode -t memory | urlencode dmi_mem
+}
+
+motherboardinfo() {
+	MANUFACTER=$(dmidecode -t baseboard | awk -F: '$1 ~ /Manufacturer/ {print $2}' | tr -s " ")
+	MODEL=$(dmidecode -t baseboard | awk -F: '$1 ~ /Product Name/ {print $2}' | tr -s " ")
+	INFO=$(echo ${MANUFACTER} ${MODEL} | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	echo ${INFO}
+}
+
+cpuinfo() {
+	# CPU model
+	RES[0]=$(cat /proc/cpuinfo | grep 'model name' | head -n1 | cut -d: -f2 | tr -s " " | sed 's/^[ ]//g'| sed 's/ /%20/g')
+
+	# Core count
+	# Count totally count of core
+	CORECOUNT=$(cat /proc/cpuinfo | grep -c processor)
+	RES[1]=${CORECOUNT}
+
+	# CPU count
+	CPUCOUNT=$(dmidecode -t processor | grep -c 'Core Count')
+	if [ ${CPUCOUNT} -eq 0 ]; then
+		CPUCOUNT=$(dmidecode -t processor | grep -c 'Current Speed')
+	fi
+	if [ ${CPUCOUNT} -eq 0 ]; then
+		CPUCOUNT=1
+	fi
+	RES[2]=${CPUCOUNT}
+	echo ${RES[*]}
+}
+
+meminfo() {
+ MEMSIZE=$(dmidecode -t memory | awk '/Size.+MB/' | awk '{sum+=$2}END{print sum}')
+ if [ -z "${MEMSIZE}" ]; then
+ 	MEMSIZE=$(grep MemTotal /proc/meminfo  | awk '{print int($2/1024)+1}')
+ fi
+ echo ${MEMSIZE}
+}
+
+is_raid() {
+	local res=$(dmesg  | grep -iE 'adaptec|lsi|megaraid|3ware|hpsa.+raid|cciss/')
+	if [ -z "${res}" ]; then
+		echo "off"
+	else
+		if dmesg | grep -qiE 'lsi|megaraid' ; then
+			if lspci 2>/dev/null | grep -iq raid 2>/dev/null ; then
+				echo "on"
+			else
+				# LSI can be internal SAS
+				echo "off"
+			fi
+		else
+			echo "on"
+		fi
+	fi
+}
+
+hdlist() {
+	# Possibly use lshw -quiet -short -C disk | awk '/\/dev\// {print $2}' ?
+	# Ned check this ^
+	HDLIST=$(ls /dev/sd?)
+	HDLIST="${HDLIST} $(ls /dev/cciss/c0d? 2>/dev/null)"
+
+
+	# This need always
+	REAL_HDLIST=""
+	for disk in ${HDLIST}; do
+		if head -c0 ${disk} 2>/dev/null; then
+			REAL_HDLIST="${REAL_HDLIST} ${disk}"
+		fi
+	done
+	echo "${REAL_HDLIST}"
+}
+
+hdinfo() {
+	if [ -z "${1}" ]; then
+		exit 1
+	else
+		HDD=${1}
+	fi
+	HD[0]=$(smartctl -i ${HDD} | awk -F:  '/Device Model/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	if [ -z "${HD[0]}" ]; then
+		HD[0]="$(smartctl -i ${HDD} | awk -F:  '/Vendor/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')-$(smartctl -i ${HDD} | awk -F:  '/Product/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')"
+	fi
+    if [ "${HD[0]}" = "-" ]; then
+        # Если нет ни имени, ни фамилии, то наверное - это утка
+        HD[0]="raidhdd"
+    fi
+	if dmesg | grep -iq 3ware; then
+		MODEL=$(parted -s ${HDD} print 2>/dev/null| awk -F: '/Model/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+		HD[0]="3ware_${MODEL}"
+	fi
+	HD[1]=$(smartctl -i ${HDD} | awk -F:  '/Serial Number/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	if [ -z "${HD[1]}" ]; then
+		HD[1]=$(smartctl -i ${HDD} | awk -F:  '/Serial number/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	fi
+
+	# Затычка для cciss smart array
+	if echo ${HDD} | grep -q "cciss" && [ -z "${HD[0]}" ]; then
+		HD[0]="cciss"
+	fi
+
+	# Затычка для HPшного raid
+	VENDOR=$(smartctl -i ${HDD} | awk -F:  '/Vendor/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	if [ "#${VENDOR}" = "#HP" ]; then
+		HD[1]=${HD[1]}-$(smartctl -i ${HDD} | awk -F:  '/Logical Unit id/ {print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	fi
+
+    # затычка для пустого serial
+	if [ -z "${HD[1]}" ]; then
+		HD[1]="None"
+	fi
+
+	HD_SIZE_TEMP=$(smartctl -i ${HDD} | awk -F:  '/User Capacity/ {print $2}' | grep -Eo '\[.+\]')
+	if [ -z "${HD_SIZE_TEMP}" ]; then
+		HD_SIZE_TEMP=$(parted -s ${HDD} print 2>/dev/null| grep "Disk ${HDD}" |awk -F: '{print $2}' | tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g')
+	fi
+	HD_SIZE_NUM=$(echo ${HD_SIZE_TEMP} | grep -Eo '[0-9\.]{1,}')
+	if echo ${HD_SIZE_TEMP} | grep -qi tb; then
+		HD_SIZE_NUM=$(echo ${HD_SIZE_NUM}*1000|bc)
+	fi
+	HD[2]=${HD_SIZE_NUM}
+	echo ${HD[*]}
+}
+
+reset () {
+	printarr $1
+	unset IF_NAME
+	unset IF_MAC
+	unset IF_VENDOR
+	unset IF_MODEL
+}
+
+printarr() {
+	if [[ ${IF_NAME} == ${1} ]]; then
+		echo "${IF_NAME} ${IF_MAC} ${IF_VENDOR}%20${IF_MODEL}"
+	fi
+}
+
+lanlist() {
+	echo $(ip link show | awk '$2~/eth/ {print $2}' | sed 's/://')
+}
+
+laninfo() {
+	lshw  -c network -quiet > /tmp/$$.txt
+	while read a
+	do
+		a=$(echo $a | sed 's/^[ ]//g')
+		if [[ ${a} == *'-network'* ]]; then
+			reset $1
+		fi
+		if [[ ${a} == 'logical name:'* ]]; then
+			IF_NAME=$(echo ${a} | cut -d: -f2 | sed 's/^[ ]//g') 
+		fi
+		if [[ ${a} == 'serial:'* ]]; then
+			IF_MAC=$(echo ${a} | sed 's/.*: //' | sed 's/^[ ]//g')
+		fi
+		if [[ ${a} == 'vendor:'* ]]; then
+			IF_VENDOR=$(echo ${a} | sed 's/.*: //' | sed 's/^[ ]//g' | sed 's/ /%20/g')
+		fi
+		if [[ ${a} == 'product:'* ]]; then
+			IF_MODEL=$(echo ${a} | sed 's/.*: //' | sed 's/^[ ]//g' | sed 's/ /%20/g')
+		fi
+
+	done < /tmp/$$.txt
+	printarr $1
+}
+
+cpu_bench() {
+	if [ -z "${2}" ]; then
+		COUNT=20000
+  else
+		COUNT=${2}
+	fi
+	THREADS=${1}
+	CPUBENCH=$(sysbench --num-threads=${THREADS} --test=cpu --cpu-max-prime=${COUNT} run | awk -F: '$0 ~ /total time:/ {print $2}' | sed -e 's/s//' | awk -v count=${COUNT} '{print count/$1}')
+	echo ${CPUBENCH}
+}
+
+mem_bench() {
+	THREADS=${1}
+	MEMSIZE=500M
+	MEMBENCH=$(sysbench --num-threads=${THREADS} --test=memory --memory-total-size=${MEMSIZE} run | awk -F: '/Operations performed:/ {print $2}' | grep -Eo '[0-9\.]{1,}\ ops/sec' | sed 's/\ ops\/sec//')
+	echo ${MEMBENCH}
+}
+
+hdd_bench() {
+        DISK=${1}
+        COUNT=4 # Gygabytes
+        OFFSET=$(echo ${COUNT}*1024| bc)
+        HDTEMPSIZE=$(echo ${2}-10|bc)
+        HDSIZE=$(echo ${HDTEMPSIZE}*10000000/1048576|bc) # переводим размер диска в байтах(криывых в размер в мегабайтайх)
+        HDSIZE=$(echo ${HDSIZE}*100|bc)
+        HDMIDDLE=$(echo ${HDSIZE}/200 | bc)
+        HDMIDDLE=$(echo ${HDMIDDLE}*100|bc)
+        SKIP_COUNT=$(echo ${HDSIZE}/${OFFSET} | bc)
+		if [ "${SKIP_COUNT}" = "1" ]; then
+			SKIP_COUNT=2
+		fi
+
+        if [ ${SKIP_COUNT} -gt 20 ]; then
+		SPEED_COUNT=0
+                SKIP_COUNT=20
+                sysctl -w vm.drop_caches=3 > /dev/null
+                zcav -c 1 -s ${SKIP_COUNT} -r ${OFFSET} -l /tmp/zcav1.log -f ${DISK}
+                if [ $? -ne 0 ]; then
+                        echo err
+                        exit
+                fi
+                SPEED1=$(cat /tmp/zcav1.log | awk '! /^#/ {speed+=$2; count+=1}END{print int(speed/count)}')
+		if [ -n "${SPEED1}" ]; then
+			SPEED_COUNT=$(echo $SPEED_COUNT+1|bc)
+		else
+			SPEED1=0
+		fi
+                sysctl -w vm.drop_caches=3 > /dev/null
+                zcav -c 1 -s ${SKIP_COUNT} -r ${HDMIDDLE}:$(echo ${HDMIDDLE}+${OFFSET}|bc) -l /tmp/zcav2.log -f ${DISK}
+                if [ $? -ne 0 ]; then
+                        echo err
+                        exit
+                fi
+                SPEED2=$(cat /tmp/zcav2.log | awk '! /^#/ {speed+=$2; count+=1}END{print int(speed/count)}')
+		if [ -n "${SPEED2}" ]; then
+			SPEED_COUNT=$(echo $SPEED_COUNT+1|bc)
+		else
+			SPEED2=0
+		fi
+                sysctl -w vm.drop_caches=3 > /dev/null
+                zcav -c 1 -s ${SKIP_COUNT} -r $(echo ${HDSIZE}-${OFFSET}|bc):${HDSIZE} -l /tmp/zcav3.log -f ${DISK}
+                if [ $? -ne 0 ]; then
+                        echo err
+                        exit
+                fi
+                SPEED3=$(cat /tmp/zcav3.log | awk '! /^#/ {speed+=$2; count+=1}END{print int(speed/count)}')
+		if [ -n "${SPEED3}" ]; then
+			SPEED_COUNT=$(echo $SPEED_COUNT+1|bc)
+		else
+			SPEED3=0
+		fi
+                SPEEDT=$(echo ${SPEED1}+${SPEED2}+${SPEED3}|bc)
+                SPEED=$(echo ${SPEEDT}/${SPEED_COUNT}|bc)
+        else
+                sysctl -w vm.drop_caches=3 > /dev/null
+                zcav -c 1 -s ${SKIP_COUNT} -l /tmp/zcav.log -f ${DISK}
+                SPEED=$(cat /tmp/zcav.log | grep -Eo '[0-9]+ megabytes per second' | grep -Eo '[0-9]+')
+        fi
+		# IF SSD DISK 
+        if [ -z "${SPEED}" ]; then
+                sysctl -w vm.drop_caches=3 > /dev/null
+                zcav -c 1 -s ${SKIP_COUNT} -l /tmp/zcav.log -f ${DISK}
+                SPEED=$(cat /tmp/zcav.log | grep -Eo '[0-9]+ megabytes per second' | grep -Eo '[0-9]+')
+        fi
+        echo ${SPEED}
+}
+
+fetch() {
+  wget --no-check-certificate -O /dev/null "${1}"
+}
+
+ipmi_load() {
+    modprobe ipmi_si
+    modprobe ipmi_devintf
+}
+
+ipmi_detect() {
+    dmidecode --type 38 | grep -qi ipmi
+    return $?
+}
+
+ipmi_user_id() {
+    bmc_channel=""
+    dmesg | grep -q BMC && bmc_channel=1
+    USER=$1
+    USERID=$(ipmitool user list ${bmc_channel} | awk -v user="${USER}" '{if($2==user && $1~"[0-9]+"){print $1}}')
+    if [ -z "${USERID}" ]; then
+        echo "User ${USER} does not exist, Getting last ID and increment it" >2
+        USERID=$(ipmitool user list ${bmc_channel} | awk '$1~"[0-9]+" && $1>max {max=$1}END{print max+1}')
+    fi
+    echo ${USERID}
+}
+
+ipmi_error() {
+    echo "Found error"
+    wget -q -O /dev/null --no-check-certificate "${RESURL}&func=error&type=ipmi"
+    return 1
+}
+
+ipmi_disable_users() {
+    local bmc_channel=""
+    dmesg | grep -q BMC && bmc_channel=1
+
+    # Guest privilege
+    local guestpriv=15
+
+    echo "Disable IPMI users"
+    for userid in $(ipmitool user list 1 | awk 'NR != 1 {print $1}'); do
+        echo "Disable user: ${userid}"
+        ipmitool user disable ${userid} || return 1
+        ipmitool user priv ${userid} ${guestpriv} ${bmc_channel} || :
+    done
+
+}
+
+ipmi() {
+    if ipmi_detect; then
+        echo "IPMI exist"
+        ipmi_load
+    else
+        return 0
+    fi
+
+    bmc_channel=""
+    dmesg | grep -q BMC && bmc_channel=1
+
+    echo "Getting IMPI information"
+    wget -O /tmp/ipmi.info -q --no-check-certificate "${RESURL}&func=server.ipmiinfo" 
+    if cat /tmp/ipmi.info | grep -q SKIP_IPMI_CONFIGURATION; then
+        echo "Found SKIP_IPMI_CONFIGURATION"
+        return 0
+    elif ! cat /tmp/ipmi.info | grep -q USER; then
+        echo "ERROR"
+        ipmi_error || return 1
+    fi
+
+    local iter=0
+    local ipmiok=false
+
+    export $(cat /tmp/ipmi.info | sed -r 's/:\s+/=/g') || ipmi_error || return 1
+
+    while [ "${ipmiok}" != "true" ] && [ ${iter} -lt 3 ]; do
+        iter=$(expr ${iter} + 1)
+
+        echo "Trying ${iter}"
+
+        ipmi_disable_users || ipmi_error || return 1
+
+
+        echo "Settinig IPMI network params: ${IP}/${NETMASK} gw ${GATEWAY}"
+        ipmitool lan set 1 ipaddr ${IP} || :
+        ipmitool lan set 1 netmask ${NETMASK} || :
+        ipmitool lan set 1 defgw ipaddr ${GATEWAY} || :
+        ipmitool lan set 1 ipsrc static || :
+
+        echo "Setting IPMI user: ${USER}"
+        USERID=$(ipmi_user_id ${USER})
+        echo "UserID = ${USERID}"
+
+        echo "Setting IPMI user ${USER} with ID ${USERID}"
+        ipmitool user set name ${USERID} ${USER} || :
+
+        echo "Setting IPMI password"
+        ipmitool user set password ${USERID} ${PASSWORD} || :
+
+        echo "Enabling IPMI user"
+        ipmitool user enable ${USERID} || :
+        ipmitool channel setaccess 1 ${USERID} link=true ipmi=true privilege=4 || ipmitool channel setaccess 1 ${USERID} ipmi=on privilege=4 || :
+
+        echo "Cheking ipmi"
+        ipmitool -H ${IP} -U ${USER} -P ${PASSWORD} sdr && ipmiok=true
+        if [ ${ipmiok} != "true" ]; then
+            # Cold reset IPMI
+            ipmitool mc reset cold || :
+        fi
+    done
+    if [ ${ipmiok} != "true" ]; then
+        ipmi_error || return 1
+    fi
+}
+
+
+detect_raid_type() {
+	RAIDSTR=$(lspci | grep -i raid)
+	if echo ${RAIDSTR} | grep -iq adaptec; then
+		# THis is adaptec
+		echo "adaptec"
+	elif echo ${RAIDSTR} | grep -iqE 'lsi|megaraid'; then
+		# THis is LSI
+		echo "lsi"
+	elif echo ${RAIDSTR} | grep -iq '3ware'; then
+		# THis is 3ware
+		echo "3ware"
+	elif echo ${RAIDSTR} | grep -iqE 'Hewlett-Packard.*Smart'; then
+		# THis is HP Smart Array
+		echo "HP-SmartArray"
+	elif dmesg | grep -q cciss/ ; then
+		echo cciss
+	else
+		echo "unknown"
+	fi
+}
+
+
+raid_status_adaptec() {
+	RSTATUS=$(arcconf getconfig 1 ld | awk -F: '/Status of logical device/ {print $2}')
+	if ! echo "${RSTATUS}" | grep -q 'Optimal' ;then
+		echo "${RSTATUS}"
+		return 1
+	fi
+}
+
+raid_status_3ware() {
+	echo "We have not support 3ware yet"
+	return 0
+}
+
+raid_status_lsi() {
+	RSTATUS=$(megacli -LDInfo -Lall -aALL |awk -F: '$1 ~ /State/ {print $2}')
+	if ! echo "${RSTATUS}" | grep -q 'Optimal' ;then
+		echo "${RSTATUS}"
+		return 1
+	fi
+}
+
+raid_status_unknown() {
+	echo "Unknown RAID"
+	return 0
+}
+
+raid_status_cciss() {
+	RSTATUS=$(cciss_vol_status /dev/cciss/c*d0)
+	if ! echo ${RSTATUS} | grep -q "OK" ; then
+		echo "${RSTATUS}"
+		return 1
+	fi
+}
+
+speed_test() {
+	bytesspeed=$(curl -k --progress-bar -w "%{speed_download}"  -o /dev/null "($CGI_MGR_URLv4)/speedtest_cgi?id=($AUTH_ID)&func=server.speedtest")
+	mbitspeed=$(echo "scale=2; ${bytesspeed} /131072" | bc)
+	wget -O /dev/null -q --no-check-certificate "($CGI_MGR_URLv4)/speedtest_cgi?id=($AUTH_ID)&speed=${mbitspeed}"
+}
+
+smart_info() {
+	# $1 - hdd
+	# $2 - hdd name
+	# $3 - hdd serial
+	smartctl -A ${1} | python -c "import sys; from urllib import urlencode; print urlencode({\"smart_${2}_${3}\": sys.stdin.read()})" | sed 's/%2520/%20/g'
+}
+
+hdd_rr_info() {
+	# $1 - hdd
+	# $2 - hdd name
+	# $3 - hdd serial
+	RR=$(smartctl -i ${1} | awk -F:  '/Rotation Rate/ {print $2}')
+    python -c "import sys; from urllib import urlencode; print urlencode({\"rr_${2}_${3}\": \"${RR}\"})" | sed 's/%2520/%20/g'
+}
+echo "Starting autorun"
+
+prepare
+
+echo "Prepare done"
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=start"
+
+ERRSTRING=""
+
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=sysinfo"
+read CPUNAME CORECOUNT CPUCOUNT <<<$(cpuinfo)
+URL="${RESURL}&func=hardware.info&cpu=${CPUNAME}&cpucnt=${CPUCOUNT}&corecnt=${CORECOUNT}&ram=$(meminfo)&raid=$(is_raid)&motherboard=$(motherboardinfo)&$(dmi_proc)&$(dmi_mem)&out=xml"
+for DISK in $(hdlist)
+do
+	read HDNAME HDSERIAL HDSIZE <<<$(hdinfo ${DISK})
+	if echo ${HDNAME} | grep -qEi 'adaptec|lsi|megaraid|treeware|3ware|dell|hewlett|hp-logical'; then
+		HDNAME=raidhdd
+	fi
+	URL="${URL}&hdd_${HDNAME}_${HDSERIAL}=${HDSIZE}"
+	URL="${URL}&$(smart_info ${DISK} ${HDNAME} ${HDSERIAL})"
+	if [ "${HDNAME}" != "raidhdd" ]; then
+		URL="${URL}&$(hdd_rr_info ${DISK} ${HDNAME} ${HDSERIAL})"
+	fi
+done
+echo "CPUinfo done"
+
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=laninfo"
+for LAN in $(lanlist)
+do
+  read IFNAME IFMAC IFMODEL <<<$(laninfo ${LAN})
+	URL="${URL}&lan_${IFNAME}=${IFMODEL}&mac_${IFNAME}=${IFMAC}"
+done <<<$(laninfo)
+echo "LAN info done"
+
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=raidinfo"
+if is_raid | grep -q on ; then
+	URL="${URL}&raid_contr=$(detect_raid_type)"
+	STAT=$(eval raid_status_$(detect_raid_type) |tr -s " " | sed 's/^[ ]//g' | sed 's/ /%20/g' | sed -r "N;s/\n/%0A/g")
+	if [ $? -eq 1 ]; then
+		ERRSTRING="${STAT}%0A${ERRSTRING}"
+	fi
+fi
+echo "IS raid done"
+
+if [ -n "${ERRSTRING}" ]; then
+	URL="${URL}&errorinfo=${ERRSTRING}"
+fi
+echo ${URL}
+fetch "${URL}"
+
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=ipmi"
+ipmi
+echo "IPMI done"
+
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=sysbench"
+URL="${RESURL}&func=perform.info&cpu=$(cpu_bench ${CORECOUNT})&ram=$(mem_bench ${CORECOUNT})"
+wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=hddbench"
+for DISK in $(hdlist)
+do
+    read HDNAME HDSERIAL HDSIZE <<<$(hdinfo ${DISK})
+	wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=hddbench_one&val=${HDNAME}_${HDSERIAL}"
+    URL="${URL}&hdd_${HDNAME}_${HDSERIAL}=$(hdd_bench ${DISK} ${HDSIZE})"
+done
+echo "${URL}"
+fetch "${URL}"
+
+if [ "($CGI_MGR_URLv4)" != "()" ]; then
+	echo "Testing speed"
+	wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=speedtest"
+	speed_test
+	echo "Testing speed done"
+fi
+
+
+if [ "($CLEAR_HDD)" = "YES" ]; then
+	echo "Clearing disks"
+	wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=fasthddclear"
+	for DISK in $(hdlist)
+	do
+		echo "Clearing ${DISK}"
+		parted -s ${DISK} mklabel gpt
+		dd if=/dev/zero of=${DISK} bs=512 count=1
+	done
+fi
+
+if [ "($FULL_HDD_CLEAR)" = "YES" ]; then
+	echo "Clearing disks full (very slow)"
+	wget -O /dev/null -q --no-check-certificate "${STATEURL}&info=slowhddclear"
+	for DISK in $(hdlist)
+	do
+		echo "Clearing ${DISK}"
+		dd if=/dev/zero of=${DISK} bs=1M 
+	done
+fi
+
+echo FINISH
+fetch "($FINISHv4)"
+reboot

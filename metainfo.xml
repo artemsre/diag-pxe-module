@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<doc>
+	<osname>Diag-x86_64</osname>
+	<version>5.57</version>
+	<tags>sysrescd</tags>
+	<support>
+		<elem version="5.14.0">DCImgr</elem>
+	</support>
+	<rebootcount>1</rebootcount>
+	<kernel>altker64</kernel>
+	<initrd>initram.igz</initrd>
+	<type>diag</type>
+	<loader>pxelinux.0</loader>
+	<pxelinuxcfg>pxelinux.conf</pxelinuxcfg>
+	<kernelcommand>nfsboot=($MGR_IPv4):($NFS) dodhcp rootpass=($PASS) ar_source=nfs://($MGR_IPv4):($NFS) docache</kernelcommand>
+	<nfs>diag64</nfs>
+	<nfs_replace>
+		<file>autorun</file>
+	</nfs_replace>
+</doc>
